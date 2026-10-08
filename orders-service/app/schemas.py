@@ -50,13 +50,59 @@ class OrderCreate(BaseModel):
 
 
 class OrderUpdate(BaseModel):
-    """Request schema for updating an existing order."""
+    """Request schema for updating an existing order.
+
+    All fields are optional; only the fields actually sent by the client
+    are updated (partial update / PATCH semantics).
+    """
 
     client_name: str | None = Field(
         default=None,
         min_length=2,
         max_length=120,
         description="Updated client name.",
+    )
+
+    gr_liv_area: float | None = Field(
+        default=None,
+        gt=0,
+        le=10_000,
+        description="Updated above-ground living area in square feet.",
+    )
+
+    total_bsmt_sf: float | None = Field(
+        default=None,
+        ge=0,
+        le=10_000,
+        description="Updated total basement area in square feet.",
+    )
+
+    garage_area: float | None = Field(
+        default=None,
+        ge=0,
+        le=2_000,
+        description="Updated garage area in square feet.",
+    )
+
+    year_built: int | None = Field(
+        default=None,
+        ge=1872,
+        le=2010,
+        description="Updated original construction year.",
+    )
+
+    overall_qual: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="Updated overall quality rating from 1 to 10.",
+    )
+
+    ms_zoning: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=10,
+        description="Updated zoning classification.",
     )
 
 

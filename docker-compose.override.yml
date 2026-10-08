@@ -1,0 +1,3 @@
+# services:
+#   forecast-api:
+#     command: ["sleep", "infinity"]

@@ -153,6 +153,16 @@ def get_order(
     return order
 
 
+PROPERTY_FIELDS = {
+    "gr_liv_area",
+    "total_bsmt_sf",
+    "garage_area",
+    "year_built",
+    "overall_qual",
+    "ms_zoning",
+}
+
+
 @app.patch(
     "/orders/{oid}",
     response_model=schemas.OrderRead,
@@ -171,10 +181,32 @@ def update_order(
             detail="Order not found.",
         )
 
+    update_data = data.model_dump(exclude_unset=True)
+    property_changed = bool(PROPERTY_FIELDS & update_data.keys())
+
+    new_price = None
+
+    if property_changed:
+        payload = {
+            field: update_data.get(field, getattr(order, field))
+            for field in PROPERTY_FIELDS
+        }
+
+        try:
+            new_price = _request_prediction(payload)
+        except Exception as exc:
+            logger.error(
+                "Forecast service is unavailable during update: %s",
+                exc,
+            )
+            new_price = None
+
     return crud.update_order(
         db,
         order,
         data,
+        new_price,
+        property_changed,
     )
 
 
