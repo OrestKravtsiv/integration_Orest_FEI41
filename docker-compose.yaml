@@ -3,8 +3,10 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_DB: ${POSTGRES_DB}
+    secrets:
+      - db_password
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -19,8 +21,6 @@ services:
       dockerfile: forecast-service/Dockerfile
     environment:
       MODEL_VERSION: ${MODEL_VERSION}
-    ports:
-      - "${FORECAST_PORT:-8001}:8001"
     healthcheck:
       test:
         [
@@ -38,9 +38,14 @@ services:
       context: .
       dockerfile: orders-service/Dockerfile
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
       FORECAST_URL: http://forecast-api:8001
       FORECAST_TIMEOUT: ${FORECAST_TIMEOUT}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+    secrets:
+      - db_password
+      - jwt_secret_key
     ports:
       - "${ORDERS_PORT:-8000}:8000"
     depends_on:
@@ -51,3 +56,9 @@ services:
 
 volumes:
   pgdata:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password
+  jwt_secret_key:
+    file: ./secrets/jwt_secret_key

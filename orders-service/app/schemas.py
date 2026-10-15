@@ -1,6 +1,49 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class UserCreate(BaseModel):
+    """Input schema for public user registration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=255)
+    password: str
+
+    @field_validator("username")
+    @classmethod
+    def username_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Username must not be blank.")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def password_length_in_bytes(cls, value: str) -> str:
+        password_length = len(value.encode("utf-8"))
+        if not 8 <= password_length <= 72:
+            raise ValueError("Password must be between 8 and 72 bytes.")
+        return value
+
+
+class UserRead(BaseModel):
+    """Public user representation; never includes password data."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    is_active: bool
+    created_at: datetime
+
+
+class Token(BaseModel):
+    """OAuth2 bearer token response."""
+
+    access_token: str
+    token_type: str
 
 
 class OrderCreate(BaseModel):

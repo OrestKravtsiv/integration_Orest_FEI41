@@ -5,3 +5,6 @@ artifacts/
 .venv/
 .pytest_cache/
 *.csv
+
+secrets/db_password
+secrets/jwt_secret_key

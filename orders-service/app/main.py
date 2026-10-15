@@ -12,7 +12,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from . import crud, schemas
+from . import auth, crud, models, schemas
 from .database import Base, engine, get_db
 
 load_dotenv()
@@ -41,6 +41,7 @@ app = FastAPI(
     title="Orders API",
     version="0.1.0",
 )
+app.include_router(auth.router)
 
 
 @retry(
@@ -78,6 +79,7 @@ def health() -> dict[str, str]:
     "/orders",
     response_model=schemas.OrderRead,
     status_code=201,
+    dependencies=[Depends(auth.get_current_user)],
 )
 def create_order(
     data: schemas.OrderCreate,
@@ -107,6 +109,7 @@ def create_order(
 @app.get(
     "/orders",
     response_model=list[schemas.OrderRead],
+    dependencies=[Depends(auth.get_current_user)],
 )
 def list_orders(
     limit: int = 20,
@@ -136,6 +139,7 @@ def list_orders(
 @app.get(
     "/orders/{oid}",
     response_model=schemas.OrderRead,
+    dependencies=[Depends(auth.get_current_user)],
 )
 def get_order(
     oid: int,
@@ -166,6 +170,7 @@ PROPERTY_FIELDS = {
 @app.patch(
     "/orders/{oid}",
     response_model=schemas.OrderRead,
+    dependencies=[Depends(auth.get_current_user)],
 )
 def update_order(
     oid: int,
@@ -213,6 +218,7 @@ def update_order(
 @app.delete(
     "/orders/{oid}",
     status_code=204,
+    dependencies=[Depends(auth.get_current_user)],
 )
 def delete_order(
     oid: int,

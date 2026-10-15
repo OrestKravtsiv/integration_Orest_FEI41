@@ -1,14 +1,34 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 load_dotenv()
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://orders:orders@localhost:5432/orders",
+
+def read_secret(name: str) -> str:
+    """Read a required Docker secret and remove trailing whitespace."""
+    path = Path("/run/secrets") / name
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"Required secret is unavailable: {path}") from exc
+
+    if not value:
+        raise RuntimeError(f"Required secret is empty: {path}")
+
+    return value
+
+
+DATABASE_URL = URL.create(
+    drivername="postgresql+psycopg",
+    username=os.environ["POSTGRES_USER"],
+    password=read_secret("db_password"),
+    host="postgres",
+    port=5432,
+    database=os.environ["POSTGRES_DB"],
 )
 
 engine = create_engine(
