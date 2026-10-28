@@ -1,4 +1,4 @@
-# Lab 2 report
+# Laboratory Work 2 Report
 
 This report records implementation checks and Docker Compose test observations.
 Results marked pending still require execution or collection of measurements.
@@ -169,3 +169,5 @@ strong evidence of overfitting in this split.
     authentication is stateless. Individual tokens cannot normally be revoked
     before expiry without adding state (such as a denylist); rotating the
     signing key invalidates all tokens signed by the old key.
+
+
