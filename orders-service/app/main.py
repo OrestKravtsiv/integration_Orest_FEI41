@@ -1,19 +1,31 @@
+import asyncio
 import logging
 import os
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy.orm import Session
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    status,
 )
+from kombu.exceptions import OperationalError
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from . import auth, crud, models, schemas
 from .database import Base, engine, get_db
+from .forecast_client import (
+    FORECAST_TIMEOUT,
+    FORECAST_URL,
+    forecast_error_code,
+)
+from .tasks import predict_order
 
 load_dotenv()
 
@@ -24,48 +36,73 @@ logging.basicConfig(
 
 logger = logging.getLogger("orders-api")
 
-FORECAST_URL = os.getenv(
-    "FORECAST_URL",
-    "http://forecast-api:8001",
-)
+BATCH_MAX_ITEMS = int(os.getenv("BATCH_MAX_ITEMS", "50"))
+if BATCH_MAX_ITEMS < 1:
+    raise RuntimeError("BATCH_MAX_ITEMS must be a positive integer.")
 
-FORECAST_TIMEOUT = float(
-    os.getenv("FORECAST_TIMEOUT", "3.0")
-)
-
-# Tables are created automatically for the initial version.
-# In production, replace this with Alembic migrations.
+# create_all handles fresh databases; the SQL migration updates existing tables.
 Base.metadata.create_all(bind=engine)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Create and close the shared HTTP client used by batch requests."""
+    async with httpx.AsyncClient(timeout=FORECAST_TIMEOUT) as client:
+        app.state.forecast_client = client
+        yield
+
 
 app = FastAPI(
     title="Orders API",
     version="0.1.0",
+    lifespan=lifespan,
 )
 app.include_router(auth.router)
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.3, max=2),
-    retry=retry_if_exception_type(
-        (httpx.ConnectError, httpx.TimeoutException)
-    ),
-    reraise=True,
-)
-def _request_prediction(payload: dict) -> float:
-    """Request a price prediction from the forecasting service.
+async def _request_batch_prediction(
+    client: httpx.AsyncClient,
+    order_id: int,
+    index: int,
+    payload: dict[str, object],
+) -> tuple[float | None, str | None, str | None]:
+    try:
+        response = await client.post(
+            f"{FORECAST_URL}/predict",
+            json=payload,
+            timeout=FORECAST_TIMEOUT,
+        )
+        response.raise_for_status()
+        body = response.json()
+        price = float(body["predicted_price"])
+        model_version = str(body["model_version"])
+        return price, model_version, None
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        error = forecast_error_code(exc)
+        logger.warning(
+            "batch forecast index=%s order_id=%s result=failed error=%s",
+            index,
+            order_id,
+            error,
+        )
+        return None, None, error
 
-    Retry only transient network failures such as connection errors
-    and timeouts. HTTP errors are not retried.
-    """
-    response = httpx.post(
-        f"{FORECAST_URL}/predict",
-        json=payload,
-        timeout=FORECAST_TIMEOUT,
-    )
-    response.raise_for_status()
 
-    return float(response.json()["predicted_price"])
+def _enqueue_prediction(order_id: int) -> None:
+    try:
+        predict_order.delay(order_id)
+    except OperationalError as exc:
+        logger.exception(
+            "order forecast order_id=%s result=enqueue_failed",
+            order_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The prediction queue is unavailable; "
+                "the order remains pending."
+            ),
+        ) from exc
 
 
 
@@ -78,31 +115,117 @@ def health() -> dict[str, str]:
 @app.post(
     "/orders",
     response_model=schemas.OrderRead,
-    status_code=201,
+    status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(auth.get_current_user)],
 )
 def create_order(
     data: schemas.OrderCreate,
+    request: Request,
+    response: Response,
     db: Session = Depends(get_db),
-):
-    """Create an order and attempt to obtain a price prediction.
+) -> models.Order:
+    """Persist an order and schedule its forecast after returning 202."""
+    order = crud.create_order(db, data)
+    response.headers["Location"] = str(
+        request.url_for("get_order", oid=order.id)
+    )
+    _enqueue_prediction(order.id)
+    return order
 
-    If the forecasting service is unavailable, the order is still
-    persisted with a null predicted price.
-    """
-    try:
-        price = _request_prediction(data.model_dump())
-    except Exception as exc:
-        logger.error(
-            "Forecast service is unavailable: %s",
-            exc,
+
+@app.post(
+    "/orders/batch",
+    response_model=schemas.BatchOrderResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(auth.get_current_user)],
+)
+async def create_orders_batch(
+    items: list[schemas.OrderCreate],
+    request: Request,
+    db: Session = Depends(get_db),
+) -> schemas.BatchOrderResponse:
+    """Create orders and concurrently request their forecasts."""
+    if not items:
+        raise HTTPException(
+            status_code=422,
+            detail="The batch must contain at least one order.",
         )
-        price = None
+    if len(items) > BATCH_MAX_ITEMS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Batch cannot contain more than {BATCH_MAX_ITEMS} orders.",
+        )
 
-    return crud.create_order(
-        db,
-        data,
-        price,
+    orders = [crud.create_order(db, item) for item in items]
+    db.close()
+
+    client: httpx.AsyncClient = request.app.state.forecast_client
+    forecasts = await asyncio.gather(
+        *(
+            _request_batch_prediction(
+                client,
+                order.id,
+                index,
+                items[index].model_dump(exclude={"client_name"}),
+            )
+            for index, order in enumerate(orders)
+        )
+    )
+
+    results: list[schemas.BatchOrderResult] = []
+    for index, (order, (price, model_version, error)) in enumerate(
+        zip(orders, forecasts, strict=True)
+    ):
+        try:
+            updated = crud.complete_order_prediction(
+                db,
+                order.id,
+                price,
+                model_version,
+            )
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception(
+                "batch order index=%s order_id=%s result=database_error",
+                index,
+                order.id,
+            )
+            raise
+
+        if not updated:
+            results.append(
+                schemas.BatchOrderResult(
+                    index=index,
+                    order_id=order.id,
+                    status="failed",
+                    model_version=None,
+                    error="OrderNotFound",
+                )
+            )
+        elif error is not None:
+            results.append(
+                schemas.BatchOrderResult(
+                    index=index,
+                    order_id=order.id,
+                    status="failed",
+                    model_version=None,
+                    error=error,
+                )
+            )
+        else:
+            results.append(
+                schemas.BatchOrderResult(
+                    index=index,
+                    order_id=order.id,
+                    status="priced",
+                    predicted_price=price,
+                    model_version=model_version,
+                )
+            )
+
+    return schemas.BatchOrderResponse(
+        total=len(results),
+        results=results,
     )
 
 
@@ -175,9 +298,10 @@ PROPERTY_FIELDS = {
 def update_order(
     oid: int,
     data: schemas.OrderUpdate,
+    response: Response,
     db: Session = Depends(get_db),
-):
-    """Update an existing order."""
+) -> models.Order:
+    """Update an order and schedule a new forecast when features change."""
     order = crud.get_order(db, oid)
 
     if order is None:
@@ -189,30 +313,17 @@ def update_order(
     update_data = data.model_dump(exclude_unset=True)
     property_changed = bool(PROPERTY_FIELDS & update_data.keys())
 
-    new_price = None
-
-    if property_changed:
-        payload = {
-            field: update_data.get(field, getattr(order, field))
-            for field in PROPERTY_FIELDS
-        }
-
-        try:
-            new_price = _request_prediction(payload)
-        except Exception as exc:
-            logger.error(
-                "Forecast service is unavailable during update: %s",
-                exc,
-            )
-            new_price = None
-
-    return crud.update_order(
+    updated_order = crud.update_order(
         db,
         order,
         data,
-        new_price,
         property_changed,
     )
+    if property_changed:
+        response.status_code = status.HTTP_202_ACCEPTED
+        _enqueue_prediction(updated_order.id)
+
+    return updated_order
 
 
 @app.delete(

@@ -8,9 +8,58 @@ services:
     secrets:
       - db_password
     volumes:
+      - ./postgres/init/01-create-mlflow-db.sql:/docker-entrypoint-initdb.d/01-create-mlflow-db.sql:ro
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: mlflow-service/Dockerfile
+    image: integration-1-mlflow:v3.1.0
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        export DB_PASSWORD="$$(cat /run/secrets/db_password)" &&
+        export DB_PASSWORD_ENCODED=$$(python -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["DB_PASSWORD"], safe=""))') &&
+        unset DB_PASSWORD &&
+        exec mlflow server --host 0.0.0.0 --port 5000
+        --backend-store-uri "postgresql://$$POSTGRES_USER:$$DB_PASSWORD_ENCODED@postgres/mlflow"
+        --serve-artifacts --artifacts-destination /mlartifacts
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+    secrets:
+      - db_password
+    volumes:
+      - mlartifacts:/mlartifacts
+    ports:
+      - "${MLFLOW_BIND_ADDRESS:-127.0.0.1}:${MLFLOW_PORT:-5000}:5000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://localhost:5000/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       timeout: 3s
       retries: 10
@@ -20,7 +69,9 @@ services:
       context: .
       dockerfile: forecast-service/Dockerfile
     environment:
-      MODEL_VERSION: ${MODEL_VERSION}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
     healthcheck:
       test:
         [
@@ -32,6 +83,55 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+  trainer:
+    build:
+      context: .
+      dockerfile: training_service/Dockerfile
+    profiles: ["train"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: house-price
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      OPTUNA_TRIALS: ${OPTUNA_TRIALS:-20}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+
+  orders-worker:
+    build:
+      context: .
+      dockerfile: orders-service/Dockerfile
+    command:
+      [
+        "uv",
+        "run",
+        "celery",
+        "-A",
+        "app.celery_app:celery_app",
+        "worker",
+        "--loglevel=INFO",
+      ]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+      FORECAST_URL: http://forecast-api:8001
+      FORECAST_TIMEOUT: ${FORECAST_TIMEOUT}
+      CELERY_BROKER_URL: redis://redis:6379/0
+    secrets:
+      - db_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      forecast-api:
+        condition: service_started
 
   orders-api:
     build:
@@ -42,7 +142,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       FORECAST_URL: http://forecast-api:8001
       FORECAST_TIMEOUT: ${FORECAST_TIMEOUT}
+      BATCH_MAX_ITEMS: ${BATCH_MAX_ITEMS:-50}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      CELERY_BROKER_URL: redis://redis:6379/0
     secrets:
       - db_password
       - jwt_secret_key
@@ -53,9 +155,13 @@ services:
         condition: service_healthy
       forecast-api:
         condition: service_started
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  redisdata:
+  mlartifacts:
 
 secrets:
   db_password:

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -49,6 +50,8 @@ class Token(BaseModel):
 class OrderCreate(BaseModel):
     """Request schema for creating a new order."""
 
+    model_config = ConfigDict(extra="forbid")
+
     client_name: str = Field(
         min_length=2,
         max_length=120,
@@ -98,6 +101,8 @@ class OrderUpdate(BaseModel):
     All fields are optional; only the fields actually sent by the client
     are updated (partial update / PATCH semantics).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     client_name: str | None = Field(
         default=None,
@@ -165,4 +170,24 @@ class OrderRead(BaseModel):
     ms_zoning: str
 
     predicted_price: float | None
+    status: Literal["pending", "priced", "failed"]
+    model_version: str | None
     created_at: datetime
+
+
+class BatchOrderResult(BaseModel):
+    """Result for one item in a batch-order request."""
+
+    index: int
+    order_id: int
+    status: Literal["priced", "failed"]
+    predicted_price: float | None = None
+    model_version: str | None = None
+    error: str | None = None
+
+
+class BatchOrderResponse(BaseModel):
+    """Results for a complete batch-order request."""
+
+    total: int
+    results: list[BatchOrderResult]

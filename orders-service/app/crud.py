@@ -7,12 +7,12 @@ from . import models, schemas
 def create_order(
     db: Session,
     data: schemas.OrderCreate,
-    price: float | None,
 ) -> models.Order:
-    """Create a new order and persist it to the database."""
+    """Create a pending order and persist it to the database."""
     order = models.Order(
         **data.model_dump(),
-        predicted_price=price,
+        predicted_price=None,
+        status="pending",
     )
 
     db.add(order)
@@ -47,26 +47,42 @@ def update_order(
     db: Session,
     order: models.Order,
     data: schemas.OrderUpdate,
-    predicted_price: float | None = None,
-    update_price: bool = False,
+    reset_prediction: bool = False,
 ) -> models.Order:
     """Update the provided fields of an existing order.
 
-    ``update_price`` controls whether ``predicted_price`` should be
-    overwritten with ``predicted_price`` (including with ``None`` when the
-    forecast could not be obtained). It is False when property features
-    were not part of this update, so the previous price stays untouched.
+    Property changes invalidate the old forecast and return the order to
+    the pending state while its replacement forecast is calculated.
     """
     for key, value in data.model_dump(exclude_unset=True).items():
         setattr(order, key, value)
 
-    if update_price:
-        order.predicted_price = predicted_price
+    if reset_prediction:
+        order.predicted_price = None
+        order.status = "pending"
 
     db.commit()
     db.refresh(order)
 
     return order
+
+
+def complete_order_prediction(
+    db: Session,
+    order_id: int,
+    predicted_price: float | None,
+    model_version: str | None = None,
+) -> bool:
+    """Persist a forecast result without creating or recreating an order."""
+    order = get_order(db, order_id)
+    if order is None:
+        return False
+
+    order.predicted_price = predicted_price
+    order.status = "priced" if predicted_price is not None else "failed"
+    order.model_version = model_version if predicted_price is not None else None
+    db.commit()
+    return True
 
 
 def delete_order(db: Session, order: models.Order) -> None:

@@ -1,13 +1,15 @@
 [project]
 name = "int-1"
 version = "0.1.0"
-requires-python = ">=3.14"
+requires-python = ">=3.13,<3.14"
 dependencies = [
+    "celery[redis]>=5.5,<6",
     "dotenv>=0.9.9",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "joblib>=1.5.3",
-    "pandas>=3.0.5",
+    "mlflow==3.1.0",
+    "pandas>=2.2,<3",
     "psycopg[binary]>=3.3.4",
     "pwdlib[argon2]>=0.3.1",
     "pydantic>=2.13.4",
@@ -17,4 +19,12 @@ dependencies = [
     "sqlalchemy>=2.0.52",
     "tenacity>=9.1.4",
     "uvicorn>=0.52.4",
+    "xgboost-cpu>=3.1,<4",
+]
+
+[dependency-groups]
+training = [
+    "matplotlib>=3.10,<4",
+    "optuna>=4.4,<5",
+    "pyarrow>=20,<21",
 ]

@@ -1,21 +1,20 @@
-"""Entry point for the forecasting service (forecast-api)."""
+import json
 import logging
 import os
 import time
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import joblib
+import mlflow
+import mlflow.pyfunc
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from mlflow import MlflowClient
 
-from .model import CAT, NUM, train_model
 from .schemas import PredictRequest, PredictResponse
 
-# Used for local runs outside Docker. In the container, orchestrator
-# environment variables are already present, and load_dotenv() does not
-# override existing environment variables.
 load_dotenv()
 
 logging.basicConfig(
@@ -24,74 +23,125 @@ logging.basicConfig(
 )
 logger = logging.getLogger("forecast-api")
 
-MODEL_PATH = Path(os.getenv("MODEL_PATH", "/app/artifacts/model.pkl"))
-MODEL_VERSION = os.getenv("MODEL_VERSION", "v0.1.0")
+MODEL_NAME = os.getenv("MODEL_NAME", "house-price")
+MODEL_ALIAS = os.getenv("MODEL_ALIAS", "prod")
+MLFLOW_TRACKING_URI = os.getenv(
+    "MLFLOW_TRACKING_URI",
+    "http://mlflow:5000",
+)
+NUMERIC_FEATURES = [
+    "GrLivArea",
+    "TotalBsmtSF",
+    "GarageArea",
+    "YearBuilt",
+    "OverallQual",
+]
+CATEGORICAL_FEATURES = ["MSZoning"]
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load the model once at startup instead of loading it per request."""
-    if MODEL_PATH.exists():
-        app.state.model = joblib.load(MODEL_PATH)
-        logger.info("Model loaded from %s", MODEL_PATH)
-    else:
-        # Development fallback for running without a pre-built image.
-        # In production, the model artifact is required.
-        logger.warning("Artifact not found - training at startup (dev-only)")
-        app.state.model = train_model()
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Resolve the registry alias and load its model and statistics at startup."""
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    client = MlflowClient()
+    try:
+        model_version = client.get_model_version_by_alias(
+            MODEL_NAME,
+            MODEL_ALIAS,
+        )
+        model = mlflow.pyfunc.load_model(
+            f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
+        )
+        stats_path = mlflow.artifacts.download_artifacts(
+            run_id=model_version.run_id,
+            artifact_path="data_stats.json",
+        )
+        data_stats = json.loads(
+            Path(stats_path).read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to resolve model registry alias %s@%s",
+            MODEL_NAME,
+            MODEL_ALIAS,
+        )
+        raise RuntimeError(
+            f"Could not load registry model {MODEL_NAME}@{MODEL_ALIAS}"
+        ) from exc
 
+    app.state.model = model
+    app.state.model_version = str(model_version.version)
+    app.state.data_stats = data_stats
+    logger.info(
+        "Loaded model %s@%s version=%s run_id=%s",
+        MODEL_NAME,
+        MODEL_ALIAS,
+        model_version.version,
+        model_version.run_id,
+    )
     yield
-
     app.state.model = None
+    app.state.data_stats = None
 
 
 app = FastAPI(
     title="Forecast API",
-    version=MODEL_VERSION,
+    version="0.1.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/health")
-def health():
-    """Health check endpoint used by the orchestrator."""
+def health(request: Request) -> dict[str, str]:
+    """Report the model version currently loaded from the registry."""
     return {
         "status": "ok",
-        "model_version": MODEL_VERSION,
+        "model_version": request.app.state.model_version,
     }
 
 
+@app.get("/model/data-stats")
+def model_data_stats(request: Request) -> dict[str, object]:
+    """Return statistics logged with the model's registry run."""
+    return request.app.state.data_stats
+
+
 @app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    """Predict a house sale price from the provided Ames Housing features.
-
-    This is a regular synchronous endpoint rather than ``async def``.
-    FastAPI executes synchronous endpoints in a thread pool, preventing
-    CPU-bound inference from blocking the event loop.
-    """
-    t0 = time.perf_counter()
-
-    # Wire contract -> exact Ames dataset column names.
-    df = pd.DataFrame([{
-        "GrLivArea": req.gr_liv_area,
-        "TotalBsmtSF": req.total_bsmt_sf,
-        "GarageArea": req.garage_area,
-        "YearBuilt": req.year_built,
-        "OverallQual": req.overall_qual,
-        "MSZoning": req.ms_zoning,
-    }])
-
-    price = float(app.state.model.predict(df[NUM + CAT])[0])
-    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-
+def predict(
+    req: PredictRequest,
+    request: Request,
+) -> PredictResponse:
+    """Predict a house sale price using the model loaded from the registry."""
+    started_at = time.perf_counter()
+    features = pd.DataFrame(
+        [
+            {
+                "GrLivArea": req.gr_liv_area,
+                "TotalBsmtSF": req.total_bsmt_sf,
+                "GarageArea": req.garage_area,
+                "YearBuilt": req.year_built,
+                "OverallQual": req.overall_qual,
+                "MSZoning": req.ms_zoning,
+            }
+        ],
+        columns=NUMERIC_FEATURES + CATEGORICAL_FEATURES,
+    )
+    features[NUMERIC_FEATURES] = features[NUMERIC_FEATURES].astype("float64")
+    prediction = request.app.state.model.predict(features)
+    predicted_price = float(prediction[0])
+    latency_ms = round(
+        (time.perf_counter() - started_at) * 1000,
+        2,
+    )
+    model_version = request.app.state.model_version
     logger.info(
-        "predict: %.2f USD (%.2f ms)",
-        price,
+        "predict: %.2f USD model_version=%s (%.2f ms)",
+        predicted_price,
+        model_version,
         latency_ms,
     )
-
     return PredictResponse(
-        predicted_price=price,
-        model_version=MODEL_VERSION,
+        predicted_price=predicted_price,
+        model_version=model_version,
         latency_ms=latency_ms,
     )

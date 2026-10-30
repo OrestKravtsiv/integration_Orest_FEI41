@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -14,10 +14,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 COPY forecast-service/app ./app
-COPY forecast-service/data ./data
 
 RUN uv sync --frozen
-RUN uv run python -m app.train
 
 EXPOSE 8001
 
